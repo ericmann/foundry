@@ -37,15 +37,16 @@ jobs:
     name: actionlint (workflow syntax)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: write   # reviewdog's github-check reporter annotates the commit
     steps:
       - uses: actions/checkout@v7
 
-      # `local` keeps the job read-only: findings are printed in the log and the
-      # step fails, rather than needing checks:write to annotate the PR.
       - uses: reviewdog/action-actionlint@v1
         with:
-          reporter: local
-          fail_level: any
+          reporter: github-check
+          fail_level: error
           level: error
 
   diagrams:
