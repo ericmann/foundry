@@ -182,7 +182,16 @@ mechanisms keep it honest:
   call itself, not for the text: a controller's transcript always
   *mentions* `foundry_run_start`, because the implement prompt it relays
   says "Call foundry_run_start", and matching on the text blocked every one
-  of its turn ends (F-01 of the 0.3.1 flight feedback). For a stop it does consider, it counts `[ ]` and `[~]` lines
+  of its turn ends (F-01 of the 0.3.1 flight feedback). Three refinements
+  serve parallel streams (0.4.0): a lock flagged `paused` — set by
+  `foundry_task_next` when a serial implementer reaches a parallel wave —
+  allows the stop; a `SubagentStop` whose transcript's *last*
+  `foundry_run_start` call passed a `stream` is blocked only while *that
+  stream* still has open tasks (`{stream: <s>}` tags on the `PROGRESS.md`
+  lines), never for a sibling's; and if the stream cannot be determined while
+  stream worktrees exist, a wave is in flight and the stop is allowed — the
+  controller re-hands out anything left unfinished, so the guard is an
+  optimisation there, not the only safety net. For a stop it does consider, it counts `[ ]` and `[~]` lines
   under `## Tasks`; if the lock exists and the count is non-zero it returns
   `{"decision":"block"}` with the next task's id and instructions to call
   `foundry_task_next`. `foundry_task_done`, `foundry_task_block` and
@@ -223,6 +232,79 @@ it receives its own, unrelated `Stop` events; since that session's own
 transcript never *called* `foundry_run_start` (a `tool_use`, not a mention in
 a relayed prompt), the guard allows those without touching the counter (F-07,
 and F-01 of the 0.3.1 flight feedback).
+
+## Parallel workstreams
+
+Added in 0.4.0. A plan may split independent tasks into **streams**; a
+flight then runs each stream on its own implementer, concurrently, instead
+of serializing the whole plan. A plan with no streams behaves exactly as it
+did before.
+
+- **Declaring streams.** A task carries `**Stream:** <slug>` in `PLAN.md`
+  and a matching `{stream: <slug>}` suffix on its `PROGRESS.md` line
+  (`- [ ] P2-03 Title {stream: api}`). The tag is parsed off the title and
+  written back verbatim whenever the line is rewritten.
+- **Waves are derived, not declared.** A wave is a maximal run of
+  consecutive tasks, in `PROGRESS.md` order, that all carry a stream tag. A
+  task without one is serial and acts as a barrier, so "scaffold → parallel
+  pieces → integration" needs no syntax beyond the one field. Waves are
+  recomputed from `PROGRESS.md` on every call and never stored;
+  `foundry_status` reports them as `waves`.
+- **The partition is validated, and an invalid one is never fatal.** A wave
+  is valid only when every one of these holds:
+  - `PLAN.md`'s `Stream:` and `PROGRESS.md`'s tag agree for every task;
+  - every task lists concrete backticked paths under `Files touched`;
+  - no two streams name overlapping paths (a token ending in `/` is a
+    directory and overlaps anything under it);
+  - no task depends on a task of a *different* stream in the same wave
+    (a dependency on anything before the wave is fine);
+  - no task touches an `extraVerify` prefix that holds an `exclusive`
+    command (and no `verify` command is exclusive);
+  - it has at least two streams.
+
+  An invalid wave runs serially, as if it had no stream tags, and a bad
+  partition is recorded as feedback rather than halting an unattended
+  flight.
+- **Concurrency at the controller.** For a valid wave, `foundry_next`
+  returns the implement stage with a `streams` list, and `go-flight` spawns
+  one implementer per entry in a single message and waits for all of them,
+  so "one stage at a time" becomes "one `foundry_next` result at a time".
+  A stream that stops early is simply handed out again on the next
+  `foundry_next`; `foundry_run_start({ stream })` resumes its worktree, so
+  the controller never reasons about it. Streams are capped at
+  `parallel.maxStreams` (default 3; `1` turns parallelism off).
+- **Review-fix rounds.** The reviewer never assigns streams, so its
+  `R<N>-<nn>` fix tasks are serial. A task it *unblocks* keeps its
+  `{stream}` tag: the fix round re-opens that wave for just the unblocked
+  stream, which runs in a fresh worktree and merges back before the serial
+  fix tasks.
+- **`exclusive` commands.** A command entry marked `exclusive: true`
+  starts something keyed to the directory or a port it runs from — wp-env
+  is the motivating case — so two of them collide, and serializing their
+  *runs* does not help because the environment outlives the command. Such a
+  command only ever runs from the main checkout, and any task that
+  triggers one is kept out of waves.
+- **Worktrees, and where each file lives.** A stream runs in its own git
+  worktree, `.foundry/worktrees/<stream>`, on a branch
+  `<build-branch>--<stream>` cut from the build branch (`foundry_run_start`
+  with `stream`, which also runs `parallel.setup` in the fresh checkout).
+  Task *code* commits happen there. `PROGRESS.md`, `PLAN.md` and
+  `state.json` live only in the main checkout: every stream-scoped call
+  reads and writes them there and commits them on the build branch, and a
+  stream never edits them. Because a stream branch never touches those
+  files, merging it back cannot conflict on bookkeeping.
+- **Merging back.** `foundry_stream_finish` merges each stream when it
+  finishes, not at the end of the wave, and removes its worktree and
+  branch. A merge conflict is the one stream failure that halts: Foundry
+  aborts the merge, keeps the stream, and records why. Serial work is
+  refused while any stream worktree still exists, so nothing ever runs on a
+  main checkout that lacks a finished stream's code.
+- **Why one shared `PROGRESS.md` is safe.** Every tool handler is
+  synchronous (`spawnSync`, never `await`), so the server handles one call at
+  a time whichever stream sent it. Tool calls therefore never interleave,
+  and that is what lets concurrent implementers share a single
+  `PROGRESS.md` and `state.json`. Keep it that way: an `await` in a tool
+  path would end this guarantee.
 
 ## Blocked tasks and skipped dependents
 
@@ -304,6 +386,7 @@ fix task is a task, and it goes through the same test-first loop as any other.
 | `.foundry/state.json` | yes | `round`, `implemented`, `reviewed`, `verdict`, `summarized`, `halted`, `preexistingUntracked`, `policies`, `signing`, `rounds` |
 | `.foundry/feedback.jsonl` | yes | one JSON line per pipeline-friction entry — `at`, `stage`, `round`, `category`, `message`, `source`; see [mcp-tools.md](./mcp-tools.md#foundry_feedback_log) |
 | `.foundry/implement.lock` | no (gitignored) | JSON `{ count, armedAt, round }` — the guard's re-block counter (a legacy bare number still reads back correctly) |
+| `.foundry/worktrees/<stream>/` | no (`.gitignore`) | a parallel stream's git worktree, present from `foundry_run_start({ stream })` until `foundry_stream_finish` merges it back; `state.streams[<s>]` records its branch and the untracked paths `parallel.setup` left behind, and `state.serialWaves` the waves degraded to serial |
 | `.foundry/mutation.json` | no (`.git/info/exclude`) | present only while `foundry_mutate` has a file mutated: `{ file, at, original }`, so a crash can be repaired by the next call |
 | `docs/PROGRESS.md` | yes | task checkboxes and the per-task log |
 | `docs/foundry.json` | yes | `verify`, `extraVerify`, `build`, `baseBranch`, `branchPrefix`, `maxRounds`, `commandTimeoutMs`, `roles`, `permissionMode` |
